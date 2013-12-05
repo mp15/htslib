@@ -222,6 +222,7 @@ static inline int hts_reg2bin(int64_t beg, int64_t end, int min_shift, int n_lvl
 	return 0;
 }
 
+// Translates bin to the linear min_shift'ed index
 static inline int hts_bin_bot(int bin, int n_lvls)
 {
 	int l, b;

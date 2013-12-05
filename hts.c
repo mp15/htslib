@@ -416,13 +416,13 @@ static inline void insert_to_l(lidx_t *l, int64_t _beg, int64_t _end, uint64_t o
 		l->m = end + 1;
 		kroundup32(l->m);
 		l->offset = (uint64_t*)realloc(l->offset, l->m * 8);
-		memset(l->offset + old_m, 0xff, 8 * (l->m - old_m)); // fill l->offset with (uint64_t)-1
+		memset(l->offset + old_m, 0xff, 8 * (l->m - old_m)); // fill l->offset with UINT64_MAX
 	}
 	if (beg == end) { // to save a loop in this case
-		if (l->offset[beg] == (uint64_t)-1) l->offset[beg] = offset;
+		if (l->offset[beg] == UINT64_MAX) l->offset[beg] = offset;
 	} else {
 		for (i = beg; i <= end; ++i)
-			if (l->offset[i] == (uint64_t)-1) l->offset[i] = offset;
+			if (l->offset[i] == UINT64_MAX) l->offset[i] = offset;
 	}
 	if (l->n < end + 1) l->n = end + 1;
 }
@@ -457,20 +457,20 @@ static void update_loff(hts_idx_t *idx, int i, int free_lidx)
 		k = kh_get(bin, bidx, idx->n_bins + 1);
 		if (k != kh_end(bidx))
 			offset0 = kh_val(bidx, k).list[0].u;
-		for (l = 0; l < lidx->n && lidx->offset[l] == (uint64_t)-1; ++l)
+		for (l = 0; l < lidx->n && lidx->offset[l] == UINT64_MAX; ++l)
 			lidx->offset[l] = offset0;
 	} else l = 1;
 	for (; l < lidx->n; ++l) // fill missing values
-		if (lidx->offset[l] == (uint64_t)-1)
+		if (lidx->offset[l] == UINT64_MAX)
 			lidx->offset[l] = lidx->offset[l-1];
-	if (bidx == 0) return;
+	if (bidx == NULL) return;
 	for (k = kh_begin(bidx); k != kh_end(bidx); ++k) // set loff
 		if (kh_exist(bidx, k))
 			kh_val(bidx, k).loff = kh_key(bidx, k) < idx->n_bins? lidx->offset[hts_bin_bot(kh_key(bidx, k), idx->n_lvls)] : 0;
 	if (free_lidx) {
 		free(lidx->offset);
 		lidx->m = lidx->n = 0;
-		lidx->offset = 0;
+		lidx->offset = NULL;
 	}
 }
 
@@ -479,7 +479,7 @@ static void compress_binning(hts_idx_t *idx, int i)
 	bidx_t *bidx = idx->bidx[i];
 	khint_t k;
 	int l, m;
-	if (bidx == 0) return;
+	if (bidx == NULL) return;
 	// merge a bin to its parent if the bin is too small
 	for (l = idx->n_lvls; l > 0; --l) {
 		unsigned start = hts_bin_first(l);
@@ -594,11 +594,11 @@ void hts_idx_destroy(hts_idx_t *idx)
 {
 	khint_t k;
 	int i;
-	if (idx == 0) return;
+	if (idx == NULL) return;
 	for (i = 0; i < idx->m; ++i) {
 		bidx_t *bidx = idx->bidx[i];
 		free(idx->lidx[i].offset);
-		if (bidx == 0) continue;
+		if (bidx == NULL) continue;
 		for (k = kh_begin(bidx); k != kh_end(bidx); ++k)
 			if (kh_exist(bidx, k))
 				free(kh_value(bidx, k).list);
@@ -608,16 +608,18 @@ void hts_idx_destroy(hts_idx_t *idx)
 	free(idx);
 }
 
-static inline long idx_read(int is_bgzf, void *fp, void *buf, long l)
+// wrapper for read only used in hts_idx_load_core
+static inline ssize_t idx_read(int is_bgzf, void *fp, void *buf, size_t l)
 {
 	if (is_bgzf) return bgzf_read((BGZF*)fp, buf, l);
-	else return (long)fread(buf, 1, l, (FILE*)fp);
+	else return (ssize_t)fread(buf, 1, l, (FILE*)fp);
 }
 
-static inline long idx_write(int is_bgzf, void *fp, const void *buf, long l)
+// wrapper for write only used in hts_idx_save_core
+static inline ssize_t idx_write(int is_bgzf, void *fp, const void *buf, size_t l)
 {
 	if (is_bgzf) return bgzf_write((BGZF*)fp, buf, l);
-	else return (long)fwrite(buf, 1, l, (FILE*)fp);
+	else return (ssize_t)fwrite(buf, 1, l, (FILE*)fp);
 }
 
 static inline void swap_bins(bins_t *p)
@@ -639,7 +641,7 @@ static void hts_idx_save_core(const hts_idx_t *idx, void *fp, int fmt)
 		idx_write(is_bgzf, fp, ed_swap_4p(&x), 4);
 	} else idx_write(is_bgzf, fp, &idx->n, 4);
 	if (fmt == HTS_FMT_TBI && idx->l_meta) idx_write(is_bgzf, fp, idx->meta, idx->l_meta);
-	for (i = 0; i < idx->n; ++i) {
+	for (i = 0; i < idx->n; ++i) { // For each reference (@SQ line)
 		khint_t k;
 		bidx_t *bidx = idx->bidx[i];
 		lidx_t *lidx = &idx->lidx[i];
@@ -674,7 +676,7 @@ static void hts_idx_save_core(const hts_idx_t *idx, void *fp, int fmt)
 			}
 		}
 write_lidx:
-		if (fmt != HTS_FMT_CSI) {
+		if (fmt != HTS_FMT_CSI) {// write linear index (which is not present in CSI)
 			if (is_be) {
 				int32_t x = lidx->n;
 				idx_write(is_bgzf, fp, ed_swap_4p(&x), 4);
@@ -734,46 +736,45 @@ static void hts_idx_load_core(hts_idx_t *idx, void *fp, int fmt)
 	int32_t i, n, is_be;
 	int is_bgzf = (fmt != HTS_FMT_BAI);
 	is_be = ed_is_big();
-	for (i = 0; i < idx->n; ++i) {
-		bidx_t *h;
+	for (i = 0; i < idx->n; ++i) { // for each reference (@SQ line)
+		bidx_t *h = idx->bidx[i] = kh_init(bin);
 		lidx_t *l = &idx->lidx[i];
 		uint32_t key;
 		int j, absent;
 		bins_t *p;
-		h = idx->bidx[i] = kh_init(bin);
-		idx_read(is_bgzf, fp, &n, 4);
+		idx_read(is_bgzf, fp, &n, sizeof(int32_t));  // read n_bin number of bins in the file
 		if (is_be) ed_swap_4p(&n);
-		for (j = 0; j < n; ++j) {
+		for (j = 0; j < n; ++j) { // load binning index
 			khint_t k;
-			idx_read(is_bgzf, fp, &key, 4);
+			idx_read(is_bgzf, fp, &key, sizeof(uint32_t)); // read bin number
 			if (is_be) ed_swap_4p(&key);
 			k = kh_put(bin, h, key, &absent);
 			p = &kh_val(h, k);
 			if (fmt == HTS_FMT_CSI) {
-				idx_read(is_bgzf, fp, &p->loff, 8);
+				idx_read(is_bgzf, fp, &p->loff, sizeof(uint64_t)); // read loffset in CSI
 				if (is_be) ed_swap_8p(&p->loff);
 			} else p->loff = 0;
-			idx_read(is_bgzf, fp, &p->n, 4);
+			idx_read(is_bgzf, fp, &p->n, sizeof(int32_t)); // read n_chunk
 			if (is_be) ed_swap_4p(&p->n);
 			p->m = p->n;
-			p->list = (hts_pair64_t*)malloc(p->m * 16);
-			idx_read(is_bgzf, fp, p->list, p->n<<4);
+			p->list = (hts_pair64_t*)malloc(p->m * 2 * sizeof(uint64_t));
+			idx_read(is_bgzf, fp, p->list, p->n<<4);  // read chunks (n_chunk * 2 * sizeof(uint64_t))
 			if (is_be) swap_bins(p);
 		}
-		if (fmt != HTS_FMT_CSI) { // load linear index
+		if (fmt != HTS_FMT_CSI) { // load linear index (which is not present in CSI)
 			int j;
-			idx_read(is_bgzf, fp, &l->n, 4);
+			idx_read(is_bgzf, fp, &l->n, sizeof(int32_t)); // read n_intv number of intervals in the file
 			if (is_be) ed_swap_4p(&l->n);
 			l->m = l->n;
 			l->offset = (uint64_t*)malloc(l->n << 3);
-			idx_read(is_bgzf, fp, l->offset, l->n << 3);
+			idx_read(is_bgzf, fp, l->offset, l->n << 3); // read ioffset * n_intv
 			if (is_be) for (j = 0; j < l->n; ++j) ed_swap_8p(&l->offset[j]);
 			for (j = 1; j < l->n; ++j) // fill missing values; may happen given older samtools and tabix
 				if (l->offset[j] == 0) l->offset[j] = l->offset[j-1];
 			update_loff(idx, i, 1);
 		}
 	}
-	if (idx_read(is_bgzf, fp, &idx->n_no_coor, 8) != 8) idx->n_no_coor = 0;
+	if (idx_read(is_bgzf, fp, &idx->n_no_coor, sizeof(uint64_t)) != sizeof(uint64_t)) idx->n_no_coor = 0;
 	if (is_be) ed_swap_8p(&idx->n_no_coor);
 }
 
@@ -878,7 +879,7 @@ hts_itr_t *hts_itr_query(const hts_idx_t *idx, int tid, int beg, int end)
 	hts_itr_t *iter = 0;
 
 	if (tid < 0) {
-		uint64_t off0 = (uint64_t)-1;
+		uint64_t off0 = UINT64_MAX;
 		khint_t k;
 		if (tid == HTS_IDX_START) {
 			if (idx->n > 0) {
@@ -895,7 +896,7 @@ hts_itr_t *hts_itr_query(const hts_idx_t *idx, int tid, int beg, int end)
 				off0 = kh_val(bidx, k).list[0].v;
 			} else return 0;
 		} else off0 = 0;
-		if (off0 != (uint64_t)-1) {
+		if (off0 != UINT64_MAX) {
 			iter = (hts_itr_t*)calloc(1, sizeof(hts_itr_t));
 			iter->read_rest = 1;
 			iter->curr_off = off0;
